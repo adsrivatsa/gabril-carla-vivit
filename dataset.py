@@ -26,7 +26,7 @@ def stack(t: torch.Tensor, k: int) -> torch.Tensor:
 class CarlaDataset(Dataset):
     def __init__(
         self,
-        path: str = "./carla-dataset",
+        path: str = "../carla-dataset",
         frame_stack: int = 4,
         gaze_temporal_decay: float = 0.8,
         val_split: float = 0.2,
