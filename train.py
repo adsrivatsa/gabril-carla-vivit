@@ -1,532 +1,694 @@
+import datetime
 import math
 import os
 import random
-from dataclasses import dataclass
-from typing import Tuple
+from typing import Literal, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as Fn
-from torch import optim
+import torch.optim as optim
+import wandb
 from torch.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 
-import augmentation
-import gaze
-import wandb
-from dataset import CarlaDataset
+import checkpoint
+import dataset
+from augmentation import Augment
+from config import config
 from device import device
-from vivit import FactorizedViViTV1
+from vivit import AuxGazeFactorizedViViT, FactorizedViViT
+
+# TF32 disabled for reproducibility; enable for faster training if needed
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 
 
-@dataclass
-class Config:
-    # paths and flags
-    game_index: int = 0
-    carla_dataset_folder: str = "./carla-dataset"
-    use_plots: bool = False
-    save_folder: str = "./models"
-    version: int = 2
-    seed: int = 42
-
-    # gaze
-    gaze_sigma: int = 30
-    gaze_beta: float = 0.99
-    gaze_alpha: float = 0.8
-
-    # augmentation
-    augment_shift_pad: int = 6
-    augment_noise_std: float = 0.01
-
-    # transformer arch
-    spatial_patch_size: Tuple[int, int] = (16, 9)
-    embedding_dim: int = 128
-    spatial_depth: int = 3
-    temporal_depth: int = 2
-    spatial_heads: int = 4
-    temporal_heads: int = 4
-    inner_dim: int = 32
-    mlp_dim: int = 256
-    dropout: float = 0.1
-
-    # hyperparams
-    learning_rate: float = 5e-4
-    epochs: int = 1000
-    train_pct: float = 0.8
-    batch_size: int = 32
-    lambda_gaze: float = 1
-    weight_decay: float = 1e-2
-    scheduler_factor: float = 0.5
-    scheduler_patience: int = 5
-    clip_grad_norm: float = 1.0
-    warmup_epochs: int = 10
-    warmup_start_factor: float = 1e-10
-    min_learning_rate: float = 1e-6
-
-    # testing
-    test_episodes: int = 10
-    max_episode_length: int = 5000
+def evaluate_agent(model: torch.nn.Module, split: Literal["test", "val"]):
+    """
+    Placeholder for CARLA rollout evaluation.
+    TODO: Hook up CARLA environment when ready.
+    """
+    episodes = config.test_episodes if split == "test" else config.val_episodes
+    # Return placeholder values matching atari's return signature
+    ep_returns = np.zeros(episodes)
+    ep_steps = np.zeros(episodes, dtype=int)
+    best_rollout_obs = np.zeros((1, 3, 180, 320), dtype=np.uint8)  # CARLA H, W
+    best_rollout_g = np.zeros((1, 180, 320), dtype=np.float32)
+    best_rollout_overlaid = np.zeros((1, 3, 180, 320), dtype=np.uint8)
+    return ep_returns, ep_steps, best_rollout_obs, best_rollout_g, best_rollout_overlaid
 
 
-# def test_agent(args: Config, model: torch.nn.Module) -> float:
-#     """
-#     Runs the model in the actual Gym environment to measure performance.
-#     """
-#     env_name = GYM_ENV_MAP.get(args.game)
-#     if env_name is None:
-#         print(f"Warning: No Gym environment found for '{args.game}' in GYM_ENV_MAP.")
-#         return 0.0
-#
-#     env = gym.make(env_name, render_mode="rgb_array")
-#     env = ResizeObservation(env, (84, 84))
-#     env = GrayscaleObservation(env, keep_dim=False)
-#     env = FrameStackObservation(env, 4)
-#
-#     action_meanings = env.unwrapped.get_action_meanings()
-#     fire_a = -1
-#     if "FIRE" in action_meanings:
-#         fire_a = action_meanings.index("FIRE")
-#
-#     total_reward = 0
-#
-#     model.eval()
-#     for i in range(args.test_episodes):
-#         obs, _ = env.reset()
-#         done = False
-#         ep_reward = 0
-#         steps = 0
-#
-#         if fire_a != -1:
-#             obs, _, _, _, _ = env.step(fire_a)
-#
-#         while not done and steps < args.max_episode_length:
-#             steps += 1
-#
-#             obs = torch.from_numpy(obs).float() / 255.0
-#             F, H, W = obs.shape
-#             obs = obs.view(1, F, 1, H, W).to(device=device)
-#
-#             with torch.no_grad():
-#                 pred_a, _ = model(obs)
-#                 action = pred_a.argmax(dim=1).item()
-#
-#             obs, reward, terminated, truncated, _ = env.step(action)
-#             done = terminated or truncated
-#             ep_reward += reward
-#
-#         total_reward += ep_reward
-#
-#     env.close()
-#
-#     return total_reward / args.test_episodes
+def gaze_kl_loss(cls_attn: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    """
+    Compute gaze regularization loss using KL divergence.
 
+    If gaze_loss_mode == "mean_then_kl": average attention across heads first,
+    then compute a single KL divergence per (batch, frame).
 
-def save_checkpoint(
-    path: str,
-    epoch: int,
-    best_reward: float,
-    wandb_id: str,
-    model: torch.nn.Module,
-    optimizer: optim.Optimizer,
-    scaler: GradScaler,
-    scheduler: SequentialLR = None,
-):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    If gaze_loss_mode == "kl_then_mean": compute KL divergence per head first,
+    then average the per-head losses.
 
-    scheduler_state = None
-    if scheduler is not None:
-        scheduler_state = scheduler.state_dict()
+    :param cls_attn: (B, F, SpatialHeads, T) — raw CLS attention from model
+    :param g: (B, F, GH, GW) — gaze target distribution (already normalized)
+    :return: scalar gaze loss
+    """
+    _, _, GH, GW = g.shape
+    eps = 1e-8
 
-    checkpoint_data = {
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler_state,
-        "scaler_state_dict": scaler.state_dict(),
-        "best_reward": best_reward,
-        "wandb_id": wandb_id,
-        "rng_states": {
-            "torch": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all(),
-            "numpy": np.random.get_state(),
-            "python": random.getstate(),
-        },
-    }
-    torch.save(checkpoint_data, path)
+    if config.gaze_loss_mode == "mean_then_kl":
+        # average across heads, then KL
+        attn = cls_attn.mean(dim=2)  # (B, F, T)
+        B, F, _ = attn.shape
+        attn = attn.view(
+            B,
+            F,
+            GH // config.spatial_patch_size[0],
+            GW // config.spatial_patch_size[1],
+        )  # (B, F, PH, PW)
+        attn = Fn.interpolate(
+            attn,
+            size=(GH, GW),
+            mode="bilinear",
+            align_corners=False,
+        )  # (B, F, GH, GW)
 
+        attn_flat = attn.reshape(B * F, -1) + eps
+        gaze_flat = g.reshape(B * F, -1) + eps
 
-def load_checkpoint(
-    path: str,
-    model: torch.nn.Module,
-    optimizer: optim.Optimizer,
-    scaler: GradScaler,
-    scheduler: SequentialLR = None,
-) -> Tuple[int, float, str | None]:
-    if not os.path.exists(path):
-        return 0, -float("inf"), None
+        attn_flat = attn_flat / attn_flat.sum(dim=1, keepdim=True)
+        gaze_flat = gaze_flat / gaze_flat.sum(dim=1, keepdim=True)
 
-    print(f"--> Found checkpoint! Resuming from {path}")
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
+        loss = torch.sum(
+            gaze_flat * (torch.log(gaze_flat) - torch.log(attn_flat)), dim=1
+        )
+        return loss.mean()
 
-    model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    elif config.gaze_loss_mode == "kl_then_mean":
+        # KL per head, then average across heads
+        B, F, heads, T = cls_attn.shape
+        pH = GH // config.spatial_patch_size[0]
+        pW = GW // config.spatial_patch_size[1]
 
-    if "scaler_state_dict" in checkpoint:
-        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        # reshape each head's tokens to spatial grid and interpolate
+        attn = cls_attn.permute(2, 0, 1, 3)  # (heads, B, F, T)
+        attn = attn.reshape(heads * B, F, pH, pW)
+        attn = Fn.interpolate(
+            attn,
+            size=(GH, GW),
+            mode="bilinear",
+            align_corners=False,
+        )  # (heads * B, F, GH, GW)
+        attn = attn.reshape(heads, B, F, GH, GW)
 
-    if scheduler is not None:
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        # expand gaze target to match heads dimension
+        gaze_exp = g.unsqueeze(0).expand(heads, -1, -1, -1, -1)  # (heads, B, F, GH, GW)
 
-    # Restore RNGs if available
-    if "rng_states" in checkpoint:
-        rng = checkpoint["rng_states"]
-        torch.set_rng_state(rng["torch"].cpu())
-        cuda_states = [state.cpu() for state in rng["cuda"]]
-        torch.cuda.set_rng_state_all(cuda_states)
-        np.random.set_state(rng["numpy"])
-        random.setstate(rng["python"])
+        attn_flat = attn.reshape(heads, B * F, -1) + eps
+        gaze_flat = gaze_exp.reshape(heads, B * F, -1) + eps
 
-    # Extract metadata
-    start_epoch = checkpoint["epoch"] + 1
-    best_reward = checkpoint.get("best_reward", -float("inf"))
-    wandb_id = checkpoint.get("wandb_id", None)
+        attn_flat = attn_flat / attn_flat.sum(dim=2, keepdim=True)
+        gaze_flat = gaze_flat / gaze_flat.sum(dim=2, keepdim=True)
 
-    print(f"--> Resumed at Epoch {start_epoch}, Best Reward: {best_reward:.4f}")
-    return start_epoch, best_reward, wandb_id
+        # KL per head: (heads, B*F)
+        kl = torch.sum(gaze_flat * (torch.log(gaze_flat) - torch.log(attn_flat)), dim=2)
+        # mean over heads, then mean over (batch, frame)
+        return kl.mean()
+
+    else:
+        raise ValueError(f"Unknown gaze_loss_mode: {config.gaze_loss_mode}")
 
 
 def calculate_loss(
-    args: Config,
     model: torch.nn.Module,
     obs: torch.Tensor,
     g: torch.Tensor,
     a: torch.Tensor,
 ):
-    with autocast(device_type="cuda", dtype=torch.float16):
-        pred_a, cls_attn = model(obs)
+    with autocast(device_type=device, dtype=torch.float16):
+        pred_a, cls_attn = model(
+            obs
+        )  # pred_a: (B, act_dim), cls_attn: (B, F, SpatialHeads, T)
 
-        # behavior cloning loss
-        policy_loss = Fn.cross_entropy(pred_a, a)
+        # behavior cloning loss (MSE for continuous actions)
+        policy_loss = Fn.mse_loss(pred_a, a)
 
-        # gaze loss
-        _, _, GH, GW = g.shape
-
-        cls_attn = cls_attn.mean(dim=2)  # (B, F, T)
-        _, F, T = cls_attn.shape
-        cls_attn = cls_attn.view(
-            -1, F, GH // args.spatial_patch_size[0], GW // args.spatial_patch_size[1]
-        )
-
-        cls_attn = Fn.interpolate(
-            cls_attn,
-            size=(GH, GW),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        gaze_loss = torch.norm(cls_attn - g, p="fro", dim=(1, 2)) ** 2
-        gaze_loss = gaze_loss.mean()
+        # gaze loss (skip when no_gaze is set)
+        if config.no_gaze:
+            gaze_loss = torch.tensor(0.0, device=obs.device)
+        else:
+            gaze_loss = gaze_kl_loss(cls_attn, g)
 
         return pred_a, policy_loss, gaze_loss
 
 
 def train(
-    args: Config,
+    observations: torch.Tensor,
+    gaze_coords: torch.Tensor,
+    actions: torch.Tensor,
 ):
     """
     Train a ViViT model.
 
-    :param args: Config.
+    :param observations: (B, F, C, H, W)
+    :param gaze_coords: Gaze coordinate data — (B, F, layers, 2) for mine,
+                         or (B, F, 41, 2) windowed coords for gabril.
+                         Masks are computed per-batch in preprocess.
+    :param actions: (B, act_dim) for continuous
     :return:
     """
-    resume_path = f"{args.save_folder}/latest_checkpoint.pt"
+    run_id = config.run_id
+    date_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    algo_label = f"{config.algorithm}_NoGaze" if config.no_gaze else config.algorithm
+    run_name = f"{algo_label}_{config.task}_seed-{config.seed}_{run_id}_{date_str}"
+    save_dir = os.path.join(config.save_folder, run_id)
+    resume_path = os.path.join(save_dir, "latest_checkpoint.pt")
 
-    # B, F, C, H, W = observations.shape
-    # n_actions = torch.max(actions).item() + 1
-    #
-    # all_actions = actions.view(-1).long()
-    # class_counts = torch.bincount(all_actions)
-    # num_classes = len(class_counts)
-    #
-    # safe_counts = class_counts.float()
-    # safe_counts[safe_counts == 0] = 1.0
-    #
-    # total_samples = len(all_actions)
-    # class_weights = total_samples / (num_classes * safe_counts)
-    # class_weights = torch.sqrt(class_weights)
-    # class_weights = torch.clamp(class_weights, min=1.0, max=10.0)
-    # class_weights = class_weights.to(device=device)
+    B, F, C, H, W = observations.shape
+    # Continuous actions: (B, act_dim)
+    actions = actions.float()
+    act_dim = actions.shape[-1] if actions.dim() > 1 else 1
+    if actions.dim() == 1:
+        actions = actions.unsqueeze(-1)  # (B,) -> (B, 1)
 
-    model = FactorizedViViTV1(
-        image_size=(180, 320),
-        patch_size=args.spatial_patch_size,
-        frames=4,
-        channels=3,
-        action_space_dim=7,
-        dim=args.embedding_dim,
-        spatial_depth=args.spatial_depth,
-        temporal_depth=args.temporal_depth,
-        spatial_heads=args.spatial_heads,
-        temporal_heads=args.temporal_heads,
-        dim_head=args.inner_dim,
-        mlp_dim=args.mlp_dim,
-        dropout=args.dropout,
-        use_flash_attn=True,
-        return_cls_attn=True,
-        use_temporal_mask=True,
-    ).to(device=device)
+    if config.algorithm == "AuxGazeFactorizedViViT":
+        model = AuxGazeFactorizedViViT(
+            image_size=(H, W),
+            patch_size=config.spatial_patch_size,
+            frames=F,
+            channels=C,
+            n_classes=act_dim,
+            dim=config.embedding_dim,
+            spatial_depth=config.spatial_depth,
+            temporal_depth=config.temporal_depth,
+            spatial_heads=config.spatial_heads,
+            temporal_heads=config.temporal_heads,
+            dim_head=config.inner_dim,
+            mlp_dim=config.mlp_dim,
+            dropout=config.dropout,
+            use_flash_attn=True,
+            return_cls_attn=True,
+            num_registers=config.num_registers,
+        )
+    else:
+        model = FactorizedViViT(
+            image_size=(H, W),
+            patch_size=config.spatial_patch_size,
+            frames=F,
+            channels=C,
+            n_classes=act_dim,
+            dim=config.embedding_dim,
+            spatial_depth=config.spatial_depth,
+            temporal_depth=config.temporal_depth,
+            spatial_heads=config.spatial_heads,
+            temporal_heads=config.temporal_heads,
+            dim_head=config.inner_dim,
+            mlp_dim=config.mlp_dim,
+            dropout=config.dropout,
+            use_flash_attn=True,
+            return_cls_attn=True,
+            num_registers=config.num_registers,
+        )
+    count_model_params(model, verbose=True)
+    model = model.to(device)
     optimizer = optim.AdamW(
-        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
     scaler = GradScaler()
 
     warmup_scheduler = LinearLR(
         optimizer,
-        start_factor=args.warmup_start_factor,
+        start_factor=config.warmup_start_factor,
         end_factor=1.0,
-        total_iters=args.warmup_epochs,
+        total_iters=config.warmup_epochs,
     )
 
-    decay_epochs = args.epochs - args.warmup_epochs
+    decay_epochs = config.epochs - config.warmup_epochs
     cosine_scheduler = CosineAnnealingLR(
-        optimizer, T_max=decay_epochs, eta_min=args.min_learning_rate
+        optimizer, T_max=decay_epochs, eta_min=config.min_learning_rate
     )
 
     scheduler = SequentialLR(
         optimizer,
         schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[args.warmup_epochs],
+        milestones=[config.warmup_epochs],
     )
 
-    start_epoch, best_reward, wandb_id = load_checkpoint(
-        resume_path, model, optimizer, scaler, scheduler
-    )
-
-    if wandb_id is None:
-        wandb_id = wandb.util.generate_id()
-
-    group_id = (
-        f"v{args.version}_"
-        f"lr{args.learning_rate:.0e}_"
-        f"lam{args.lambda_gaze}_"
-        f"dim{args.embedding_dim}_"
-        f"pt{args.spatial_patch_size[0]}_"
-        f"d{args.dropout}"
-    )
     # run = wandb.init(
     #     entity="papaya147-ml",
-    #     project="GABRIL-Carla-ViViT",
-    #     config=args.__dict__,
-    #     group=group_id,
-    #     name=f"v{args.version}",
+    #     project="ViViT-GABRIL-CARLA",
+    #     config=config.__dict__,
+    #     name=run_name,
     #     job_type="train",
-    #     id=wandb_id,
+    #     id=run_id,
     #     resume="allow",
     # )
 
-    train_dataset = CarlaDataset(
-        path=args.carla_dataset_folder,
-        gaze_temporal_decay=args.gaze_beta,
-        val_split=0.2,
-        set_name="train",
+    dataset_len = len(observations)
+    train_size = int(config.train_pct * dataset_len)
+    val_size = dataset_len - train_size
+
+    train_obs, val_obs = observations[:train_size], observations[train_size:]
+    train_gaze, val_gaze = (
+        gaze_coords[:train_size],
+        gaze_coords[train_size:],
     )
-    input("ready")
-    exit()
-    val_dataset = CarlaDataset(
-        path=args.carla_dataset_folder,
-        gaze_temporal_decay=args.gaze_beta,
-        val_split=0.2,
-        set_name="val",
-    )
+    train_acts, val_acts = actions[:train_size], actions[train_size:]
+
+    train_dataset = TensorDataset(train_obs, train_gaze, train_acts)
+    val_dataset = TensorDataset(val_obs, val_gaze, val_acts)
+
+    # Deterministic shuffling via generator for reproducibility
+    train_generator = torch.Generator().manual_seed(config.seed)
+    val_generator = torch.Generator().manual_seed(config.seed + 1)
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=config.batch_size,
         shuffle=True,
-        num_workers=8,
+        num_workers=4,
         pin_memory=True,
         persistent_workers=True,
+        generator=train_generator,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=config.batch_size,
         shuffle=True,
-        num_workers=8,
+        num_workers=4,
         pin_memory=True,
         persistent_workers=True,
+        generator=val_generator,
     )
 
-    for e in range(start_epoch, args.epochs):
+    start_epoch, best_return = checkpoint.load(
+        resume_path,
+        model,
+        optimizer,
+        scaler,
+        scheduler,
+        train_generator=train_generator,
+        val_generator=val_generator,
+    )
+
+    for e in range(start_epoch, config.epochs):
         metrics = {
-            "train_loss": 0,
-            "train_policy_loss": 0,
-            "train_gaze_loss": 0,
-            "train_acc": 0,
-            "val_loss": 0,
-            "val_policy_loss": 0,
-            "val_gaze_loss": 0,
-            "val_acc": 0,
+            "train/train_loss": 0,
+            "train/train_policy_loss": 0,
+            "train/train_gaze_loss": 0,
+            "train/train_mae": 0,
         }
 
         # train loop
         model.train()
         for obs, g, a in train_loader:
-            obs, g = preprocess(args, obs, g)
-            print(obs.shape, g.shape)
-            exit()
-            a = a.to(device=device)
+            obs, g = preprocess(obs, g)  # obs: (B, F, C, H, W), g: (B, F, H, W)
+            a = a.to(device=device).float()
+            if a.dim() == 1:
+                a = a.unsqueeze(-1)  # (B,) -> (B, 1)
 
             optimizer.zero_grad()
 
-            pred_a, policy_loss, gaze_loss = calculate_loss(model, obs, g, a)
-            loss = policy_loss + args.lambda_gaze * gaze_loss
+            pred_a, policy_loss, gaze_loss = calculate_loss(
+                model, obs, g, a
+            )  # pred_a: (B, act_dim)
+            loss = policy_loss + config.lambda_gaze * gaze_loss
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+            clip_grad_norm_(model.parameters(), config.clip_grad_norm)
             scaler.step(optimizer)
             scaler.update()
 
-            acc = (pred_a.argmax(dim=1) == a).float().sum()
+            mae = Fn.l1_loss(pred_a, a)
 
             curr_batch_size = obs.size(0)
 
-            metrics["train_loss"] += loss.item() * curr_batch_size
-            metrics["train_policy_loss"] += policy_loss.item() * curr_batch_size
-            metrics["train_gaze_loss"] += gaze_loss.item() * curr_batch_size
-            metrics["train_acc"] += acc.item()
+            metrics["train/train_loss"] += loss.item() * curr_batch_size
+            metrics["train/train_policy_loss"] += policy_loss.item() * curr_batch_size
+            metrics["train/train_gaze_loss"] += gaze_loss.item() * curr_batch_size
+            metrics["train/train_mae"] += mae.item() * curr_batch_size
 
-        # validation
+        # validation (every epoch)
+        metrics["eval/val_loss"] = 0
+        metrics["eval/val_policy_loss"] = 0
+        metrics["eval/val_gaze_loss"] = 0
+        metrics["eval/val_mae"] = 0
+
         model.eval()
         with torch.no_grad():
             for obs, g, a in val_loader:
-                obs, g = preprocess(args, obs, g, augment=False)
-                a = a.to(device=device)
+                obs, g = preprocess(
+                    obs, g, augment=False
+                )  # obs: (B, F, C, H, W), g: (B, F, H, W)
+                a = a.to(device=device).float()
+                if a.dim() == 1:
+                    a = a.unsqueeze(-1)  # (B,) -> (B, 1)
 
                 pred_a, policy_loss, gaze_loss = calculate_loss(model, obs, g, a)
-                loss = policy_loss + args.lambda_gaze * gaze_loss
+                loss = policy_loss + config.lambda_gaze * gaze_loss
 
-                acc = (pred_a.argmax(dim=1) == a).float().sum()
+                mae = Fn.l1_loss(pred_a, a)
 
                 curr_batch_size = obs.size(0)
 
-                metrics["val_loss"] += loss.item() * curr_batch_size
-                metrics["val_policy_loss"] += policy_loss.item() * curr_batch_size
-                metrics["val_gaze_loss"] += gaze_loss.item() * curr_batch_size
-                metrics["val_acc"] += acc.item()
+                metrics["eval/val_loss"] += loss.item() * curr_batch_size
+                metrics["eval/val_policy_loss"] += policy_loss.item() * curr_batch_size
+                metrics["eval/val_gaze_loss"] += gaze_loss.item() * curr_batch_size
+                metrics["eval/val_mae"] += mae.item() * curr_batch_size
+
+        # rollouts (every 100 epochs)
+        mean_return = -1
+        if (e + 1) % 100 == 0:
+            (
+                ep_returns,
+                ep_steps,
+                best_rollout_obs,
+                best_rollout_g,
+                best_rollout_overlaid,
+            ) = evaluate_agent(model=model, split="val")
+            mean_return = float(ep_returns.mean())
+
+            if mean_return > best_return:
+                best_return = mean_return
+                best_save_path = f"{save_dir}/best_return.pt"
+                os.makedirs(save_dir, exist_ok=True)
+                torch.save(model.state_dict(), best_save_path)
 
         scheduler.step()
-
-        # testing
-        mean_reward = test_agent(args, model)
 
         log_data = {
             k: v / train_size if "train" in k else v / val_size
             for k, v in metrics.items()
         }
         log_data["epoch"] = e
-        log_data["reward"] = mean_reward
-        log_data["learning_rate"] = optimizer.param_groups[0]["lr"]
+        log_data["train/learning_rate"] = optimizer.param_groups[0]["lr"]
+        if mean_return != -1:
+            log_data["eval/mean_return"] = mean_return
+            log_data["eval/std_return"] = float(ep_returns.std())
+            log_data["eval/max_return"] = float(ep_returns.max())
+            log_data["eval/min_return"] = float(ep_returns.min())
 
+            log_data["eval/mean_steps"] = float(ep_steps.mean())
+            log_data["eval/std_steps"] = float(ep_steps.std())
+            log_data["eval/best_rollout_obs"] = wandb.Video(
+                best_rollout_obs, fps=15, format="gif"
+            )
+            log_data["eval/best_rollout_g"] = wandb.Video(
+                best_rollout_g, fps=15, format="gif"
+            )
+            log_data["eval/best_rollout_overlaid"] = wandb.Video(
+                best_rollout_overlaid, fps=15, format="gif"
+            )
+
+        print(log_data)
         run.log(data=log_data)
 
-        if mean_reward > best_reward:
-            best_reward = mean_reward
-            save_path = f"{args.save_folder}/{args.game}/best_reward.pt"
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            torch.save(model.state_dict(), save_path)
-
-        save_checkpoint(
-            resume_path, e, best_reward, wandb_id, model, optimizer, scaler, scheduler
+        checkpoint.save(
+            resume_path,
+            e,
+            best_return,
+            model,
+            optimizer,
+            scaler,
+            scheduler,
+            train_generator=train_generator,
+            val_generator=val_generator,
         )
 
-    save_path = f"{args.save_folder}/{args.game}/final.pt"
-    torch.save(model.state_dict(), save_path)
+    # testing and saving final model
+    final_save_path = os.path.join(save_dir, "final.pt")
+    torch.save(model.state_dict(), final_save_path)
+
+    ep_returns, ep_steps, _, _, _ = evaluate_agent(model=model, split="test")
+
+    mean_val = np.mean(ep_returns)
+    std_val = np.std(ep_returns)
+    max_val = np.max(ep_returns)
+    min_val = np.min(ep_returns)
+
+    eval_table = wandb.Table(data=[[r] for r in ep_returns], columns=["return"])
+
+    summary_table = wandb.Table(
+        columns=["Run Name", "Mean Return", "Std Dev", "Max Return", "Min Return"],
+        data=[
+            [
+                run.name,
+                f"{mean_val:.2f}",
+                f"{std_val:.2f}",
+                f"{max_val:.2f}",
+                f"{min_val:.2f}",
+            ]
+        ],
+    )
+
+    run.log(
+        {
+            "test/final/returns": eval_table,
+            "test/final/return_distribution": wandb.plot.histogram(
+                eval_table, "return"
+            ),
+            "test/final/mean_return": mean_val,
+            "test/final/std_return": std_val,
+            "test/final/max_return": max_val,
+            "test/final/min_return": min_val,
+            "test/final/summary_return": summary_table,
+        }
+    )
+
+    final_model = wandb.Artifact(f"{run.name}-final-model", type="model")
+    final_model.add_file(final_save_path)
+    run.log_artifact(final_model)
+
+    # testing and saving best model
+    best_save_path = os.path.join(save_dir, "best_return.pt")
+    model.load_state_dict(
+        torch.load(best_save_path, map_location=device, weights_only=False)
+    )
+
+    ep_returns, ep_steps, _, _, _ = evaluate_agent(model=model, split="test")
+
+    mean_val = np.mean(ep_returns)
+    std_val = np.std(ep_returns)
+    max_val = np.max(ep_returns)
+    min_val = np.min(ep_returns)
+
+    eval_table = wandb.Table(data=[[r] for r in ep_returns], columns=["return"])
+
+    summary_table = wandb.Table(
+        columns=["Run Name", "Mean Return", "Std Dev", "Max Return", "Min Return"],
+        data=[
+            [
+                run.name,
+                f"{mean_val:.2f}",
+                f"{std_val:.2f}",
+                f"{max_val:.2f}",
+                f"{min_val:.2f}",
+            ]
+        ],
+    )
+
+    run.log(
+        {
+            "test/best/returns": eval_table,
+            "test/best/return_distribution": wandb.plot.histogram(eval_table, "return"),
+            "test/best/mean_return": mean_val,
+            "test/best/std_return": std_val,
+            "test/best/max_return": max_val,
+            "test/best/min_return": min_val,
+            "test/best/summary_return": summary_table,
+        }
+    )
+
+    best_model = wandb.Artifact(f"{run.name}-best-model", type="model")
+    best_model.add_file(best_save_path)
+    run.log_artifact(best_model)
 
     run.finish()
 
 
 def preprocess(
-    args: Config,
     observations: torch.Tensor,
     gaze_coords: torch.Tensor,
     augment: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Augment the observations and gaze masks. Convert the gaze masks into patches.
-    Normalize the gaze patches.
+    Compute gaze masks from gaze coordinates, augment the observations and
+    gaze masks, and normalize the gaze masks.
 
-    :param args: Config.
     :param observations: (B, F, C, H, W)
-    :param gaze_coords: (B, F, layers, 2)
-    :param augment: Augment the data with random shifts and noise?
-    :return: (B, F, C, H, W), (B, F, T)
+    :param gaze_coords: Gaze coordinate data — (B, F, layers, 2) for mine,
+                         or (B, F, 41, 2) windowed coords for gabril.
+    :param augment: Augment the data with random shifts, color jitter and noise?
+    :return: (B, F, C, H, W), (B, F, H, W)
     """
     B, F, C, H, W = observations.shape
+
+    if config.loading_method == "mine":
+        gaze_masks = dataset.decaying_gaussian_mask(
+            gaze_coords=gaze_coords,
+            shape=(H, W),
+            base_sigma=config.gaze_sigma,
+            temporal_decay=config.gaze_alpha,
+            blur_growth=config.gaze_beta,
+        )
+    else:
+        gaze_masks = dataset.gabril_gaze_mask_carla(
+            gaze_coords,
+            height=H,
+            width=W,
+            gaze_sigma=config.gaze_sigma,
+            gaze_alpha=config.gaze_alpha,
+            gaze_beta=config.gaze_beta,
+        )
+
     random_example = random.randint(0, len(observations) - 1)
 
-    gaze_masks = gaze.decaying_gaussian_mask(
-        gaze_coords,
-        shape=(H, W),
-        base_sigma=args.gaze_sigma,
-        temporal_decay=args.gaze_alpha,
-        blur_growth=args.gaze_beta,
-    )
+    # pre augmentation plots
+    if config.use_plots:
+        plot_frames(observations[random_example])
+        plot_frames(gaze_masks.unsqueeze(2)[random_example])
 
-    aug_observations = observations.to(device=device)
-    aug_gaze_masks = gaze_masks.to(device=device)
     if augment:
-        aug_observations, aug_gaze_masks = augmentation.random_shift(
-            aug_observations, aug_gaze_masks, pad=args.augment_shift_pad
+        augment_fn = Augment(
+            frame_shape=(F, C, H, W),
+            crop_padding=config.augment_crop_padding,
+            cutout_hole_size=config.augment_cutout_hole_size,
+            p_spatial_corruption=config.augment_p_spatial_corruptions,
+            seed=config.seed,
         )
-        aug_observations, aug_gaze_masks = augmentation.random_noise(
-            aug_observations, aug_gaze_masks, std=args.augment_noise_std
-        )
+        observations, gaze_masks = augment_fn(observations, gaze_masks)
 
-    # # plotting random observations and gazes
-    # if args.use_plots:
-    #     atari.plot_frames(aug_observations[random_example])
-    #     atari.plot_frames(aug_gaze_masks.unsqueeze(2)[random_example])
+    observations = observations.to(device=device)  # (B, F, C, H, W)
+    gaze_masks = gaze_masks.to(device=device)  # (B, F, H, W)
 
-    # gaze_mask_patches = gaze.patchify(
-    #     aug_gaze_masks, patch_size=args.spatial_patch_size
-    # )
-    # B, F, gridR, gridR, patchR, patchC = gaze_mask_patches.shape
-    #
-    # # plotting random gaze patches
-    # if args.use_plots:
-    #     gaze.plot_patches(gaze_mask_patches[random_example][0], 1)
-    #
-    # # pooling the last 2 dims of gaze
-    # gaze_mask_patches = gaze_mask_patches.mean(dim=(-2, -1))
-    # gaze_mask_patches = gaze_mask_patches.view(B, F, gridR * gridR)
-    #
+    # post augmentation plots
+    if config.use_plots:
+        plot_frames(observations[random_example])
+        plot_frames(gaze_masks.unsqueeze(2)[random_example])
+
     # normalizing
-    gaze_sums = aug_gaze_masks.sum(dim=(-2, -1), keepdim=True)
-    aug_gaze_masks = aug_gaze_masks / (gaze_sums + 1e-8)
+    gaze_sums = gaze_masks.sum(dim=(-2, -1), keepdim=True)
+    gaze_masks = gaze_masks / (gaze_sums + 1e-8)  # (B, F, H, W)
 
-    return aug_observations, aug_gaze_masks  # gaze_mask_patches
+    return observations, gaze_masks
+
+
+def plot_frames(frames: torch.Tensor):
+    """
+    Plots frames from a (F, C, H, W) tensor in a square grid.
+
+    :param frames: (F, C, H, W). Values should be roughly in [0, 1] for floats or [0, 255] for uint8.
+    """
+    frames = frames.detach().cpu().numpy()
+
+    if frames.ndim != 4:
+        raise ValueError(f"Expected shape (F, C, H, W), got {frames.shape}")
+
+    F, C, H, W = frames.shape
+
+    cols = math.ceil(math.sqrt(F))
+    rows = math.ceil(F / cols)
+
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+
+    if isinstance(axes, plt.Axes):
+        axes = np.array([axes])
+    axes = axes.flatten()
+
+    for i in range(rows * cols):
+        ax = axes[i]
+
+        if i < F:
+            img = frames[i]
+
+            img = np.transpose(img, (1, 2, 0))
+
+            if C == 1:
+                ax.imshow(img.squeeze(-1))
+            else:
+                ax.imshow(img)
+
+            ax.set_title(f"Frame {i}")
+
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def count_model_params(model: torch.nn.Module, verbose: bool = True) -> int:
+    """
+    Count and optionally print model parameters.
+
+    :param model: PyTorch model
+    :param verbose: If True, print total params and per-module breakdown
+    :return: Total number of trainable parameters
+    """
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    if verbose:
+        print(f"Total params: {total:,}")
+        print(f"Trainable params: {trainable:,}")
+        for name, module in model.named_children():
+            n = sum(p.numel() for p in module.parameters())
+            if n > 0:
+                print(f"  {name}: {n:,}")
+
+    return trainable
 
 
 def set_seed(seed: int):
     """
-    Sets the seed for all sources of randomness.
+    Sets the seed for all sources of randomness to ensure reproducible training.
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
+    # cuDNN: deterministic algorithms (slower but reproducible)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # Disable TF32 for bit-exact reproducibility
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 
 def main():
-    args = Config()
+    set_seed(config.seed)
 
-    set_seed(args.seed)
+    print(f"Task: {config.task}")
 
-    train(args)
+    if config.loading_method == "mine":
+        # For mine: folder must contain seed_* subdirs (e.g. route_X with seed_200, seed_201, ...)
+        # Use first route from task's train routes
+        route_id = dataset.TASK_TO_ROUTE[config.task]["train"][0][0]
+        folder = f"{config.carla_dataset_folder}/route_{route_id}"
+        observations, gaze_coords, actions = dataset.load_data(
+            folder, device="cpu", gaze_temporal_decay=config.gaze_alpha
+        )
+        actions = actions.float()
+    elif config.loading_method == "gabril":
+        observations, actions, gaze_coords, _ = dataset.gabril_load_data_carla(
+            task=config.task,
+            datapath=config.carla_dataset_folder,
+            frame_stack=config.frame_stack,
+            num_episodes=dataset.MAX_EPISODES_CARLA[config.task],
+        )
+        actions = actions.float()  # continuous actions
+        # gaze_coords here is gaze_windows (B, F, 41, 2) for gabril_gaze_mask_carla
+    else:
+        raise ValueError(f"Unknown loading method: {config.loading_method}")
+
+    print(observations.size())
+    exit()
+
+    train(observations, gaze_coords, actions)
 
 
 if __name__ == "__main__":

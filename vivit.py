@@ -316,10 +316,11 @@ class ViViT(nn.Module):
         return x, cls_attn
 
 
-class FactorizedViViTV1(nn.Module):
+class FactorizedViViT(nn.Module):
     """
     Factorized Vision Transformer. First transformer does per frame, spatial attention.
     Second transformer does temporal attention on the first transformers [CLS] tokens.
+    Optional register tokens are extra spatial tokens that do not affect temporal or classification.
     """
 
     def __init__(
@@ -328,7 +329,7 @@ class FactorizedViViTV1(nn.Module):
         patch_size: Tuple[int, int],
         frames: int,
         channels: int,
-        action_space_dim: int,
+        n_classes: int,
         dim: int,
         spatial_depth: int,
         temporal_depth: int,
@@ -339,6 +340,7 @@ class FactorizedViViTV1(nn.Module):
         dropout: float = 0.0,
         use_flash_attn: bool = True,
         return_cls_attn: bool = False,
+        num_registers: int = 0,
         use_temporal_mask: bool = True,
     ):
         super().__init__()
@@ -346,10 +348,19 @@ class FactorizedViViTV1(nn.Module):
         ih, iw = image_size
         ph, pw = patch_size
         patches = ih // ph * iw // pw
+        self.num_registers = num_registers
+        self.num_patches = patches
+        num_spatial_tokens = patches + 1 + num_registers
 
         self.patch_emb = PatchEmbedding(patch_size, channels, dim)
         self.spatial_cls_token = nn.Parameter(torch.zeros(1, 1, dim))
-        self.spatial_pos_enc = nn.Parameter(torch.randn(1, frames, patches + 1, dim))
+        self.spatial_pos_enc = nn.Parameter(
+            torch.randn(1, frames, num_spatial_tokens, dim)
+        )
+        if num_registers > 0:
+            self.register_tokens = nn.Parameter(torch.zeros(1, num_registers, dim))
+        else:
+            self.register_tokens = None
         self.flatten_frames = Rearrange("b f n e -> (b f) n e")
 
         self.spatial_transformer = Transformer(
@@ -388,7 +399,7 @@ class FactorizedViViTV1(nn.Module):
             mask=temporal_mask,
         )
 
-        self.l1 = nn.Linear(dim, action_space_dim)
+        self.l1 = nn.Linear(dim, n_classes)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -401,21 +412,30 @@ class FactorizedViViTV1(nn.Module):
         x = self.patch_emb(x)  # (B, F, T, E)
         spatial_cls_tokens = self.spatial_cls_token.expand(B, F, 1, -1)
         x = torch.cat((spatial_cls_tokens, x), dim=2)  # (B, F, T + 1, E)
-        x = x + self.spatial_pos_enc  # (B, F, T + 1, E)
-        x = self.flatten_frames(x)  # (B * F, T + 1, E)
+        if self.register_tokens is not None:
+            reg_tokens = self.register_tokens.expand(
+                B, F, -1, -1
+            )  # (B, F, num_registers, E)
+            x = torch.cat((x, reg_tokens), dim=2)  # (B, F, T + 1 + num_registers, E)
+        x = x + self.spatial_pos_enc  # (B, F, num_spatial_tokens, E)
+        x = self.flatten_frames(x)  # (B * F, num_spatial_tokens, E)
 
         x, last_block_attn = self.spatial_transformer(
             x
-        )  # x: (B * F, T + 1, E), last_block_attn: (B * F, SpatialHeads, T + 1, T + 1)
+        )  # x: (B * F, num_spatial_tokens, E), last_block_attn: (B * F, SpatialHeads, num_spatial_tokens, num_spatial_tokens)
 
         cls_attn = self.unflatten_attn(
             last_block_attn
-        )  # (B, F, SpatialHeads, T + 1, T + 1)
-        cls_attn = cls_attn[:, :, :, 0, :]  # (B, F, SpatialHeads, T + 1)
-        cls_attn = cls_attn[:, :, :, 1:]  # (B, F, SpatialHeads, T)
+        )  # (B, F, SpatialHeads, num_spatial_tokens, num_spatial_tokens)
+        cls_attn = cls_attn[:, :, :, 0, :]  # (B, F, SpatialHeads, num_spatial_tokens)
+        cls_attn = cls_attn[
+            :, :, :, 1 : 1 + self.num_patches
+        ]  # (B, F, SpatialHeads, T) — exclude CLS and registers
 
-        x = self.unflatten_frames(x)  # (B, F, T + 1, E)
-        x = x[:, :, 0, :]  # (B, F, E)
+        x = self.unflatten_frames(x)  # (B, F, num_spatial_tokens, E)
+        x = x[
+            :, :, 0, :
+        ]  # (B, F, E) — only CLS for temporal; registers not used downstream
         temporal_cls_tokens = self.temporal_cls_token.expand(B, 1, -1)
         x = torch.cat((temporal_cls_tokens, x), dim=1)  # (B, F + 1, E)
         x = x + self.temporal_pos_enc  # (B, F + 1, E)
@@ -427,236 +447,256 @@ class FactorizedViViTV1(nn.Module):
         return x, cls_attn
 
 
-# class FactorizedViViTV2(nn.Module):
-#     """
-#     Factorized Vision Transformer. First transformer does per frame, spatial attention and has two [CLS] tokens: [POL] and [GAZE].
-#     Second transformer does temporal attention on the first transformers [POL] tokens.
-#     """
-#
-#     def __init__(
-#         self,
-#         image_size: Tuple[int, int],
-#         patch_size: Tuple[int, int],
-#         frames: int,
-#         channels: int,
-#         n_classes: int,
-#         dim: int,
-#         spatial_depth: int,
-#         temporal_depth: int,
-#         spatial_heads: int,
-#         temporal_heads: int,
-#         dim_head: int,
-#         mlp_dim: int,
-#         dropout: float = 0.0,
-#         use_flash_attn: bool = True,
-#         return_cls_attn: bool = False,
-#         use_temporal_mask: bool = True,
-#     ):
-#         super().__init__()
-#
-#         ih, iw = image_size
-#         ph, pw = patch_size
-#         patches = ih // ph * iw // pw
-#
-#         self.patch_emb = PatchEmbedding(patch_size, channels, dim)
-#         self.spatial_pol_token = nn.Parameter(torch.randn(1, 1, dim))
-#         self.spatial_gaze_token = nn.Parameter(torch.randn(1, 1, dim))
-#         self.spatial_pos_enc = nn.Parameter(torch.randn(1, frames, patches + 2, dim))
-#         self.flatten_frames = Rearrange("b f n e -> (b f) n e")
-#
-#         self.spatial_transformer = Transformer(
-#             dim=dim,
-#             depth=spatial_depth,
-#             heads=spatial_heads,
-#             dim_head=dim_head,
-#             mlp_dim=mlp_dim,
-#             dropout=dropout,
-#             use_flash_attn=use_flash_attn,
-#             return_last_block_attn=return_cls_attn,
-#         )
-#
-#         self.unflatten_attn = Rearrange("(b f) h t1 t2 -> b f h t1 t2", f=frames)
-#         self.unflatten_frames = Rearrange("(b f) n e -> b f n e", f=frames)
-#         self.temporal_cls_token = nn.Parameter(torch.zeros(1, dim))
-#         self.temporal_pos_enc = nn.Parameter(torch.randn(1, frames + 1, dim))
-#
-#         temporal_mask = None
-#         if use_temporal_mask:
-#             # [POL] and [GAZE] should attend to everything
-#             # other tokens should only attend to past tokens
-#             temporal_mask = torch.ones((frames + 1, frames + 1), dtype=torch.bool)
-#             temporal_mask = torch.tril(temporal_mask)
-#             temporal_mask[0, :] = True
-#
-#         self.temporal_transformer = Transformer(
-#             dim=dim,
-#             depth=temporal_depth,
-#             heads=temporal_heads,
-#             dim_head=dim_head,
-#             mlp_dim=mlp_dim,
-#             dropout=dropout,
-#             use_flash_attn=use_flash_attn,
-#             return_last_block_attn=False,  # [CLS] vs patch attention only exists in first transformer's attention layers
-#             mask=temporal_mask,
-#         )
-#
-#         self.l1 = nn.Linear(dim, n_classes)
-#
-#     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-#         """
-#         :param x: (B, F, C, H, W)
-#         :return: (B, num_classes), (B, F, Heads, T)
-#         """
-#         B, F, C, H, W = x.shape
-#
-#         # T = H / PH * W / PW * C, the number of patches/tokens
-#         x = self.patch_emb(x)  # (B, F, T, E)
-#         pol_tokens = self.spatial_pol_token.expand(B, F, -1, -1)  # (B, F, 1, E)
-#         gaze_tokens = self.spatial_gaze_token.expand(B, F, -1, -1)  # (B, F, 1, E)
-#         x = torch.cat((pol_tokens, gaze_tokens, x), dim=2)  # (B, F, T + 2, E)
-#         x = x + self.spatial_pos_enc  # (B, F, T + 2, E)
-#         x = self.flatten_frames(x)  # (B * F, T + 2, E)
-#
-#         x, last_block_attn = self.spatial_transformer(
-#             x
-#         )  # x: (B * F, T + 2, E), last_block_attn: (B * F, SpatialHeads, T + 2, T + 2)
-#
-#         cls_attn = self.unflatten_attn(
-#             last_block_attn
-#         )  # (B, F, SpatialHeads, T + 2, T + 2)
-#         gaze_attn = cls_attn[:, :, :, 1, :]  # (B, F, SpatialHeads, T + 2)
-#         gaze_attn = gaze_attn[:, :, :, 2:]  # (B, F, SpatialHeads, T)
-#
-#         x = self.unflatten_frames(x)  # (B, F, T + 2, E)
-#         x = x[:, :, 0, :]  # (B, F, E)
-#         temporal_cls_tokens = self.temporal_cls_token.expand(B, 1, -1)
-#         x = torch.cat((temporal_cls_tokens, x), dim=1)  # (B, F + 1, E)
-#         x = x + self.temporal_pos_enc  # (B, F + 1, E)
-#
-#         x, _ = self.temporal_transformer(x)  # (B, F + 1, E)
-#         x = x[:, 0, :]  # (B, E)
-#         x = self.l1(x)  # (B, n_classes)
-#
-#         return x, gaze_attn
-#
-#
-# class FactorizedViViTV3(nn.Module):
-#     """
-#     Factorized Vision Transformer. First transformer does per frame, spatial attention and has two [CLS] tokens: [POL] and [GAZE].
-#     Second transformer does temporal attention on the first transformers [POL] and [GAZE] tokens.
-#     """
-#
-#     def __init__(
-#         self,
-#         image_size: Tuple[int, int],
-#         patch_size: Tuple[int, int],
-#         frames: int,
-#         channels: int,
-#         n_classes: int,
-#         dim: int,
-#         spatial_depth: int,
-#         temporal_depth: int,
-#         spatial_heads: int,
-#         temporal_heads: int,
-#         dim_head: int,
-#         mlp_dim: int,
-#         dropout: float = 0.0,
-#         use_flash_attn: bool = True,
-#         return_cls_attn: bool = False,
-#         use_temporal_mask: bool = True,
-#     ):
-#         super().__init__()
-#
-#         ih, iw = image_size
-#         ph, pw = patch_size
-#         patches = ih // ph * iw // pw
-#
-#         self.patch_emb = PatchEmbedding(patch_size, channels, dim)
-#         self.spatial_pol_token = nn.Parameter(torch.randn(1, 1, dim))
-#         self.spatial_gaze_token = nn.Parameter(torch.randn(1, 1, dim))
-#         self.spatial_pos_enc = nn.Parameter(torch.randn(1, frames, patches + 2, dim))
-#         self.flatten_frames = Rearrange("b f n e -> (b f) n e")
-#
-#         self.spatial_transformer = Transformer(
-#             dim=dim,
-#             depth=spatial_depth,
-#             heads=spatial_heads,
-#             dim_head=dim_head,
-#             mlp_dim=mlp_dim,
-#             dropout=dropout,
-#             use_flash_attn=use_flash_attn,
-#             return_last_block_attn=return_cls_attn,
-#         )
-#
-#         self.unflatten_attn = Rearrange("(b f) h t1 t2 -> b f h t1 t2", f=frames)
-#         self.unflatten_frames = Rearrange("(b f) n e -> b f n e", f=frames)
-#         self.temporal_cls_token = nn.Parameter(torch.zeros(1, dim))
-#         self.temporal_pos_enc = nn.Parameter(torch.randn(1, frames + 1, dim))
-#         self.fusion_proj = nn.Linear(dim * 2, dim)
-#         self.fusion_norm = nn.LayerNorm(dim)
-#         self.fusion_dropout = nn.Dropout(dropout)
-#
-#         temporal_mask = None
-#         if use_temporal_mask:
-#             # [POL] and [GAZE] should attend to everything
-#             # other tokens should only attend to past tokens
-#             temporal_mask = torch.ones((frames + 1, frames + 1), dtype=torch.bool)
-#             temporal_mask = torch.tril(temporal_mask)
-#             temporal_mask[0, :] = True
-#
-#         self.temporal_transformer = Transformer(
-#             dim=dim,
-#             depth=temporal_depth,
-#             heads=temporal_heads,
-#             dim_head=dim_head,
-#             mlp_dim=mlp_dim,
-#             dropout=dropout,
-#             use_flash_attn=use_flash_attn,
-#             return_last_block_attn=False,  # [CLS] vs patch attention only exists in first transformer's attention layers
-#             mask=temporal_mask,
-#         )
-#
-#         self.l1 = nn.Linear(dim, n_classes)
-#
-#     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-#         """
-#         :param x: (B, F, C, H, W)
-#         :return: (B, num_classes), (B, F, Heads, T)
-#         """
-#         B, F, C, H, W = x.shape
-#
-#         # T = H / PH * W / PW * C, the number of patches/tokens
-#         x = self.patch_emb(x)  # (B, F, T, E)
-#         pol_tokens = self.spatial_pol_token.expand(B, F, -1, -1)  # (B, F, 1, E)
-#         gaze_tokens = self.spatial_gaze_token.expand(B, F, -1, -1)  # (B, F, 1, E)
-#         x = torch.cat((pol_tokens, gaze_tokens, x), dim=2)  # (B, F, T + 2, E)
-#         x = x + self.spatial_pos_enc  # (B, F, T + 2, E)
-#         x = self.flatten_frames(x)  # (B * F, T + 2, E)
-#
-#         x, last_block_attn = self.spatial_transformer(
-#             x
-#         )  # x: (B * F, T + 2, E), last_block_attn: (B * F, SpatialHeads, T + 2, T + 2)
-#
-#         cls_attn = self.unflatten_attn(
-#             last_block_attn
-#         )  # (B, F, SpatialHeads, T + 2, T + 2)
-#         gaze_attn = cls_attn[:, :, :, 1, :]  # (B, F, SpatialHeads, T + 2)
-#         gaze_attn = gaze_attn[:, :, :, 2:]  # (B, F, SpatialHeads, T)
-#
-#         x = self.unflatten_frames(x)  # (B, F, T + 2, E)
-#         pol = x[:, :, 0, :]  # (B, F, E)
-#         gaze = x[:, :, 1, :]  # (B, F, E)
-#         fused = torch.cat((pol, gaze), dim=-1)  # (B, F, 2 * E)
-#         fused = self.fusion_proj(fused)  # (B, F, E)
-#         fused = self.fusion_norm(fused)  # (B, F, E)
-#         x = self.fusion_dropout(fused)  # (B, F, E)
-#
-#         temporal_cls_tokens = self.temporal_cls_token.expand(B, 1, -1)
-#         x = torch.cat((temporal_cls_tokens, x), dim=1)  # (B, F + 1, E)
-#         x = x + self.temporal_pos_enc  # (B, F + 1, E)
-#
-#         x, _ = self.temporal_transformer(x)  # (B, F + 1, E)
-#         x = x[:, 0, :]  # (B, E)
-#         x = self.l1(x)  # (B, n_classes)
-#
-#         return x, gaze_attn
+class AuxGazeFactorizedViViT(nn.Module):
+    """
+    Factorized Vision Transformer. First transformer does per frame, spatial attention and has two [CLS] tokens: [POL] and [GAZE].
+    Second transformer does temporal attention on the first transformers [POL] tokens.
+    Optional register tokens are extra spatial tokens that do not affect temporal, classification, or gaze attention output.
+    """
+
+    def __init__(
+        self,
+        image_size: Tuple[int, int],
+        patch_size: Tuple[int, int],
+        frames: int,
+        channels: int,
+        n_classes: int,
+        dim: int,
+        spatial_depth: int,
+        temporal_depth: int,
+        spatial_heads: int,
+        temporal_heads: int,
+        dim_head: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+        use_flash_attn: bool = True,
+        return_cls_attn: bool = False,
+        num_registers: int = 0,
+        use_temporal_mask: bool = True,
+    ):
+        super().__init__()
+
+        ih, iw = image_size
+        ph, pw = patch_size
+        patches = ih // ph * iw // pw
+        self.num_registers = num_registers
+        self.num_patches = patches
+        num_spatial_tokens = patches + 2 + num_registers
+
+        self.patch_emb = PatchEmbedding(patch_size, channels, dim)
+        self.spatial_pol_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.spatial_gaze_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.spatial_pos_enc = nn.Parameter(
+            torch.randn(1, frames, num_spatial_tokens, dim)
+        )
+        if num_registers > 0:
+            self.register_tokens = nn.Parameter(torch.zeros(1, num_registers, dim))
+        else:
+            self.register_tokens = None
+        self.flatten_frames = Rearrange("b f n e -> (b f) n e")
+
+        self.spatial_transformer = Transformer(
+            dim=dim,
+            depth=spatial_depth,
+            heads=spatial_heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+            use_flash_attn=use_flash_attn,
+            return_last_block_attn=return_cls_attn,
+        )
+
+        self.unflatten_attn = Rearrange("(b f) h t1 t2 -> b f h t1 t2", f=frames)
+        self.unflatten_frames = Rearrange("(b f) n e -> b f n e", f=frames)
+        self.temporal_cls_token = nn.Parameter(torch.zeros(1, dim))
+        self.temporal_pos_enc = nn.Parameter(torch.randn(1, frames + 1, dim))
+
+        temporal_mask = None
+        if use_temporal_mask:
+            # [POL] and [GAZE] should attend to everything
+            # other tokens should only attend to past tokens
+            temporal_mask = torch.ones((frames + 1, frames + 1), dtype=torch.bool)
+            temporal_mask = torch.tril(temporal_mask)
+            temporal_mask[0, :] = True
+
+        self.temporal_transformer = Transformer(
+            dim=dim,
+            depth=temporal_depth,
+            heads=temporal_heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+            use_flash_attn=use_flash_attn,
+            return_last_block_attn=False,  # [CLS] vs patch attention only exists in first transformer's attention layers
+            mask=temporal_mask,
+        )
+
+        self.l1 = nn.Linear(dim, n_classes)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        :param x: (B, F, C, H, W)
+        :return: (B, num_classes), (B, F, Heads, T)
+        """
+        B, F, C, H, W = x.shape
+
+        # T = H / PH * W / PW * C, the number of patches/tokens
+        x = self.patch_emb(x)  # (B, F, T, E)
+        pol_tokens = self.spatial_pol_token.expand(B, F, -1, -1)  # (B, F, 1, E)
+        gaze_tokens = self.spatial_gaze_token.expand(B, F, -1, -1)  # (B, F, 1, E)
+        x = torch.cat((pol_tokens, gaze_tokens, x), dim=2)  # (B, F, T + 2, E)
+        if self.register_tokens is not None:
+            reg_tokens = self.register_tokens.expand(
+                B, F, -1, -1
+            )  # (B, F, num_registers, E)
+            x = torch.cat((x, reg_tokens), dim=2)  # (B, F, T + 2 + num_registers, E)
+        x = x + self.spatial_pos_enc  # (B, F, num_spatial_tokens, E)
+        x = self.flatten_frames(x)  # (B * F, num_spatial_tokens, E)
+
+        x, last_block_attn = self.spatial_transformer(
+            x
+        )  # x: (B * F, num_spatial_tokens, E), last_block_attn: (B * F, SpatialHeads, num_spatial_tokens, num_spatial_tokens)
+
+        cls_attn = self.unflatten_attn(
+            last_block_attn
+        )  # (B, F, SpatialHeads, num_spatial_tokens, num_spatial_tokens)
+        gaze_attn = cls_attn[:, :, :, 1, :]  # (B, F, SpatialHeads, num_spatial_tokens)
+        gaze_attn = gaze_attn[
+            :, :, :, 2 : 2 + self.num_patches
+        ]  # (B, F, SpatialHeads, T) — exclude POL, GAZE, registers
+
+        x = self.unflatten_frames(x)  # (B, F, num_spatial_tokens, E)
+        x = x[
+            :, :, 0, :
+        ]  # (B, F, E) — only POL for temporal; GAZE and registers not used downstream
+        temporal_cls_tokens = self.temporal_cls_token.expand(B, 1, -1)
+        x = torch.cat((temporal_cls_tokens, x), dim=1)  # (B, F + 1, E)
+        x = x + self.temporal_pos_enc  # (B, F + 1, E)
+
+        x, _ = self.temporal_transformer(x)  # (B, F + 1, E)
+        x = x[:, 0, :]  # (B, E)
+        x = self.l1(x)  # (B, n_classes)
+
+        return x, gaze_attn
+
+
+class FusedGazeFactorizedViViT(nn.Module):
+    """
+    Factorized Vision Transformer. First transformer does per frame, spatial attention and has two [CLS] tokens: [POL] and [GAZE].
+    Second transformer does temporal attention on the first transformers [POL] and [GAZE] tokens.
+    """
+
+    def __init__(
+        self,
+        image_size: Tuple[int, int],
+        patch_size: Tuple[int, int],
+        frames: int,
+        channels: int,
+        n_classes: int,
+        dim: int,
+        spatial_depth: int,
+        temporal_depth: int,
+        spatial_heads: int,
+        temporal_heads: int,
+        dim_head: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+        use_flash_attn: bool = True,
+        return_cls_attn: bool = False,
+        use_temporal_mask: bool = True,
+    ):
+        super().__init__()
+
+        ih, iw = image_size
+        ph, pw = patch_size
+        patches = ih // ph * iw // pw
+
+        self.patch_emb = PatchEmbedding(patch_size, channels, dim)
+        self.spatial_pol_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.spatial_gaze_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.spatial_pos_enc = nn.Parameter(torch.randn(1, frames, patches + 2, dim))
+        self.flatten_frames = Rearrange("b f n e -> (b f) n e")
+
+        self.spatial_transformer = Transformer(
+            dim=dim,
+            depth=spatial_depth,
+            heads=spatial_heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+            use_flash_attn=use_flash_attn,
+            return_last_block_attn=return_cls_attn,
+        )
+
+        self.unflatten_attn = Rearrange("(b f) h t1 t2 -> b f h t1 t2", f=frames)
+        self.unflatten_frames = Rearrange("(b f) n e -> b f n e", f=frames)
+        self.temporal_cls_token = nn.Parameter(torch.zeros(1, dim))
+        self.temporal_pos_enc = nn.Parameter(torch.randn(1, frames + 1, dim))
+        self.fusion_proj = nn.Linear(dim * 2, dim)
+        self.fusion_norm = nn.LayerNorm(dim)
+        self.fusion_dropout = nn.Dropout(dropout)
+
+        temporal_mask = None
+        if use_temporal_mask:
+            # [POL] and [GAZE] should attend to everything
+            # other tokens should only attend to past tokens
+            temporal_mask = torch.ones((frames + 1, frames + 1), dtype=torch.bool)
+            temporal_mask = torch.tril(temporal_mask)
+            temporal_mask[0, :] = True
+
+        self.temporal_transformer = Transformer(
+            dim=dim,
+            depth=temporal_depth,
+            heads=temporal_heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+            use_flash_attn=use_flash_attn,
+            return_last_block_attn=False,  # [CLS] vs patch attention only exists in first transformer's attention layers
+            mask=temporal_mask,
+        )
+
+        self.l1 = nn.Linear(dim, n_classes)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        :param x: (B, F, C, H, W)
+        :return: (B, num_classes), (B, F, Heads, T)
+        """
+        B, F, C, H, W = x.shape
+
+        # T = H / PH * W / PW * C, the number of patches/tokens
+        x = self.patch_emb(x)  # (B, F, T, E)
+        pol_tokens = self.spatial_pol_token.expand(B, F, -1, -1)  # (B, F, 1, E)
+        gaze_tokens = self.spatial_gaze_token.expand(B, F, -1, -1)  # (B, F, 1, E)
+        x = torch.cat((pol_tokens, gaze_tokens, x), dim=2)  # (B, F, T + 2, E)
+        x = x + self.spatial_pos_enc  # (B, F, T + 2, E)
+        x = self.flatten_frames(x)  # (B * F, T + 2, E)
+
+        x, last_block_attn = self.spatial_transformer(
+            x
+        )  # x: (B * F, T + 2, E), last_block_attn: (B * F, SpatialHeads, T + 2, T + 2)
+
+        cls_attn = self.unflatten_attn(
+            last_block_attn
+        )  # (B, F, SpatialHeads, T + 2, T + 2)
+        gaze_attn = cls_attn[:, :, :, 1, :]  # (B, F, SpatialHeads, T + 2)
+        gaze_attn = gaze_attn[:, :, :, 2:]  # (B, F, SpatialHeads, T)
+
+        x = self.unflatten_frames(x)  # (B, F, T + 2, E)
+        pol = x[:, :, 0, :]  # (B, F, E)
+        gaze = x[:, :, 1, :]  # (B, F, E)
+        fused = torch.cat((pol, gaze), dim=-1)  # (B, F, 2 * E)
+        fused = self.fusion_proj(fused)  # (B, F, E)
+        fused = self.fusion_norm(fused)  # (B, F, E)
+        x = self.fusion_dropout(fused)  # (B, F, E)
+
+        temporal_cls_tokens = self.temporal_cls_token.expand(B, 1, -1)
+        x = torch.cat((temporal_cls_tokens, x), dim=1)  # (B, F + 1, E)
+        x = x + self.temporal_pos_enc  # (B, F + 1, E)
+
+        x, _ = self.temporal_transformer(x)  # (B, F + 1, E)
+        x = x[:, 0, :]  # (B, E)
+        x = self.l1(x)  # (B, n_classes)
+
+        return x, gaze_attn
