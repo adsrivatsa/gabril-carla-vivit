@@ -2,7 +2,7 @@ import argparse
 import hashlib
 import json
 from dataclasses import asdict, dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -77,13 +77,26 @@ class Config:
     # testing
     test_episodes: int
 
+    # CARLA rollout evaluation (None = skip rollouts)
+    carla_host: str
+    carla_port: Optional[int]
+    carla_traffic_manager_port: int
+    carla_routes_path: str
+
     @property
     def run_id(self) -> str:
         """Deterministic hash of training-relevant config fields.
         Used as both the wandb run ID and the checkpoint subfolder name."""
         d = asdict(self)
         # Exclude fields that don't affect training
-        for key in ("save_folder", "use_plots"):
+        for key in (
+            "save_folder",
+            "use_plots",
+            "carla_host",
+            "carla_port",
+            "carla_traffic_manager_port",
+            "carla_routes_path",
+        ):
             d.pop(key, None)
         # Sort keys for determinism, convert tuples (lists after asdict) back to stable repr
         raw = json.dumps(d, sort_keys=True)
@@ -191,6 +204,24 @@ parser.add_argument("--max-episode-length", type=int, default=5000)
 # testing
 parser.add_argument("--test-episodes", type=int, default=100)
 
+# CARLA rollout evaluation
+parser.add_argument(
+    "--carla-port",
+    type=int,
+    default=None,
+    help="CARLA server port. If None, skip rollout evaluation.",
+)
+parser.add_argument("--carla-host", type=str, default="localhost")
+parser.add_argument(
+    "--carla-traffic-manager-port", type=int, default=8000
+)
+parser.add_argument(
+    "--carla-routes-path",
+    type=str,
+    default="routes/bench2drive220.xml",
+    help="Path to routes XML file.",
+)
+
 args = parser.parse_args()
 
 config = Config(
@@ -250,4 +281,9 @@ config = Config(
     max_episode_length=args.max_episode_length,
     # testing
     test_episodes=args.test_episodes,
+    # CARLA rollout evaluation
+    carla_host=args.carla_host,
+    carla_port=args.carla_port,
+    carla_traffic_manager_port=args.carla_traffic_manager_port,
+    carla_routes_path=args.carla_routes_path,
 )

@@ -2,7 +2,7 @@ import datetime
 import math
 import os
 import random
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -27,18 +27,109 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 
-def evaluate_agent(model: torch.nn.Module, split: Literal["test", "val"]):
+def evaluate_agent(
+    model: torch.nn.Module,
+    split: Literal["test", "val"],
+    save_dir: Optional[str] = None,
+):
     """
-    Placeholder for CARLA rollout evaluation.
-    TODO: Hook up CARLA environment when ready.
+    Run CARLA rollout evaluation when carla_port and routes_path are set.
+    Uses carla/rollout.py for self-contained simulation. Otherwise returns placeholder.
     """
     episodes = config.test_episodes if split == "test" else config.val_episodes
-    # Return placeholder values matching atari's return signature
+
+    # CARLA eval disabled (carla_port=None skips rollouts)
+    if config.carla_port is None:
+        ep_returns = np.zeros(episodes)
+        ep_steps = np.zeros(episodes, dtype=int)
+        best_rollout_obs = np.zeros((1, 3, 180, 320), dtype=np.uint8)
+        best_rollout_g = np.zeros((1, 180, 320), dtype=np.float32)
+        best_rollout_overlaid = np.zeros((1, 3, 180, 320), dtype=np.uint8)
+        return ep_returns, ep_steps, best_rollout_obs, best_rollout_g, best_rollout_overlaid
+
+    routes_path = config.carla_routes_path
+    if not os.path.isabs(routes_path):
+        routes_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), routes_path
+        )
+    if not os.path.exists(routes_path):
+        print(f"Routes file not found: {routes_path}")
+        ep_returns = np.zeros(episodes)
+        ep_steps = np.zeros(episodes, dtype=int)
+        best_rollout_obs = np.zeros((1, 3, 180, 320), dtype=np.uint8)
+        best_rollout_g = np.zeros((1, 180, 320), dtype=np.float32)
+        best_rollout_overlaid = np.zeros((1, 3, 180, 320), dtype=np.uint8)
+        return ep_returns, ep_steps, best_rollout_obs, best_rollout_g, best_rollout_overlaid
+
+    route_ids = [
+        str(r) for r, _ in dataset.TASK_TO_ROUTE[config.task]["test"]
+    ]
+
+    if not route_ids:
+        ep_returns = np.zeros(episodes)
+        ep_steps = np.zeros(episodes, dtype=int)
+        best_rollout_obs = np.zeros((1, 3, 180, 320), dtype=np.uint8)
+        best_rollout_g = np.zeros((1, 180, 320), dtype=np.float32)
+        best_rollout_overlaid = np.zeros((1, 3, 180, 320), dtype=np.uint8)
+        return ep_returns, ep_steps, best_rollout_obs, best_rollout_g, best_rollout_overlaid
+
+    from rollout import run_single_rollout
+
+    H, W = 180, 320
     ep_returns = np.zeros(episodes)
     ep_steps = np.zeros(episodes, dtype=int)
-    best_rollout_obs = np.zeros((1, 3, 180, 320), dtype=np.uint8)  # CARLA H, W
-    best_rollout_g = np.zeros((1, 180, 320), dtype=np.float32)
-    best_rollout_overlaid = np.zeros((1, 3, 180, 320), dtype=np.uint8)
+    best_rollout_obs = np.zeros((1, 3, H, W), dtype=np.uint8)
+    best_rollout_g = np.zeros((1, H, W), dtype=np.float32)
+    best_rollout_overlaid = np.zeros((1, 3, H, W), dtype=np.uint8)
+    best_score = -1.0
+
+    for ep in range(min(episodes, len(route_ids))):
+        route_id = route_ids[ep % len(route_ids)]
+        seed = config.seed + ep
+        result = run_single_rollout(
+            model=model,
+            routes_file=routes_path,
+            route_id=route_id,
+            host=config.carla_host,
+            port=config.carla_port,
+            traffic_manager_port=config.carla_traffic_manager_port,
+            seed=seed,
+            frame_rate=20.0,
+            obs_res=(H, W),
+            frame_stack=config.frame_stack,
+            act_dim=7,
+            patch_size=config.spatial_patch_size,
+            max_steps=config.max_episode_length,
+            waypoint_threshold=3.0,
+            noop_steps=10,
+        )
+        score = result.get("score_composed", 0.0)
+        ep_returns[ep] = score
+        ep_steps[ep] = result.get("steps", 0)
+        if "error" in result:
+            print(f"Rollout {ep} (route {route_id}): {result['error']}")
+
+        if score > best_score and result.get("obs_frames"):
+            best_score = score
+            obs_frames = result["obs_frames"]
+            gaze_frames = result.get("gaze_frames", [])
+            n = min(len(obs_frames), len(gaze_frames), 30)
+            if n > 0:
+                obs = np.stack(obs_frames[:n], axis=0)
+                obs = np.transpose(obs, (0, 3, 1, 2))
+                best_rollout_obs = obs[:1]
+                if gaze_frames:
+                    g = np.stack(gaze_frames[:n], axis=0)
+                    g_min, g_max = g.min(), g.max()
+                    g = (g - g_min) / (g_max - g_min + 1e-8)
+                    best_rollout_g = g[:1].astype(np.float32)
+                    overlaid = obs[:1].astype(np.float32) * np.expand_dims(
+                        g[:1], 1
+                    )
+                    best_rollout_overlaid = np.clip(
+                        overlaid, 0, 255
+                    ).astype(np.uint8)
+
     return ep_returns, ep_steps, best_rollout_obs, best_rollout_g, best_rollout_overlaid
 
 
@@ -369,7 +460,7 @@ def train(
                 best_rollout_obs,
                 best_rollout_g,
                 best_rollout_overlaid,
-            ) = evaluate_agent(model=model, split="val")
+            ) = evaluate_agent(model=model, split="val", save_dir=save_dir)
             mean_return = float(ep_returns.mean())
 
             if mean_return > best_return:
@@ -423,7 +514,9 @@ def train(
     final_save_path = os.path.join(save_dir, "final.pt")
     torch.save(model.state_dict(), final_save_path)
 
-    ep_returns, ep_steps, _, _, _ = evaluate_agent(model=model, split="test")
+    ep_returns, ep_steps, _, _, _ = evaluate_agent(
+        model=model, split="test", save_dir=save_dir
+    )
 
     mean_val = np.mean(ep_returns)
     std_val = np.std(ep_returns)
@@ -469,7 +562,9 @@ def train(
         torch.load(best_save_path, map_location=device, weights_only=False)
     )
 
-    ep_returns, ep_steps, _, _, _ = evaluate_agent(model=model, split="test")
+    ep_returns, ep_steps, _, _, _ = evaluate_agent(
+        model=model, split="test", save_dir=save_dir
+    )
 
     mean_val = np.mean(ep_returns)
     std_val = np.std(ep_returns)
